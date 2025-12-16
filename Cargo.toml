@@ -1,0 +1,16 @@
+[package]
+name = "moon-landr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+avian2d = "0.4.1"
+bevy = { version = "0.17.3", features = ["dynamic_linking"] }
+log = { version = "*", features = ["max_level_debug", "release_max_level_warn"] }
+noiz = "0.3.0"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
