@@ -6,23 +6,15 @@ use bevy::{camera::ScalingMode, prelude::*};
 use noiz::prelude::*;
 use std::{
     fmt::Debug,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 //// TODO
-/// Win condition should be to land, landing pads should only add multipliers to score. Currently, win is only on pads (that's wrong).
-/// Losing condition should be to crash into ground at high speed or bad angle.
+/// Terrain should be infinite, generated as the player moves. Also the camera should follow the player.
+/// Should have landing pads working correctly.
 /// Should add more animation, background stars, parallax scrolling, sound effects, etc.
 /// Should add a scoring system based on fuel used, landing accuracy, time taken, etc.
-/// Should restrict player rotation
 /// Should make ground generation more interesting
-/// Should make lander more realistic with physics
-/// Should have walls on sides of screen to prevent flying offscreen.
-
-/// CONSTANTS:
-/// Lander weight: 15.100 kg tonnes (8.200 kg for fuel)
-/// Moon gravity: 1.62 m/s2
-/// Lander main engine thrust: 45 kN
 
 #[derive(SubStates, Clone, PartialEq, Eq, Hash, Debug, Default)]
 #[source(GameState = GameState::Game)]
@@ -52,11 +44,16 @@ struct ScoreMultiplier(f32);
 #[derive(Resource)]
 struct WinTimer(Timer);
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
-struct PlayerFuelText;
+#[derive(Resource)]
+struct TimePassed(Duration);
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
-struct PlayerVelocityText;
+#[derive(Component)]
+enum HudText {
+    Fuel,
+    XVelocity,
+    YVelocity,
+    TimePassed,
+}
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 struct Ground;
@@ -75,14 +72,18 @@ pub(crate) fn plugin(app: &mut App) {
         .add_systems(
             Update,
             (
-                ((
-                    control_system,
-                    ground_detection_system,
-                    start_win_timer_system,
-                    reset_win_timer_system,
-                    tick_win_timer_system,
+                (
+                    (
+                        control_system,
+                        ground_detection_system,
+                        start_win_timer_system,
+                        reset_win_timer_system,
+                        tick_win_timer_system,
+                    )
+                        .chain(),
+                    fuel_weight_system,
+                    playtime_system,
                 )
-                    .chain(),)
                     .run_if(in_state(GamePhase::Running)),
                 (end_input_system).run_if(not(in_state(GamePhase::Running))),
                 animation_system,
@@ -101,11 +102,14 @@ fn setup_level(
     mut commands: Commands,
     mut clear_color: ResMut<ClearColor>,
     asset_server: Res<AssetServer>,
+    font: Res<MainFont>,
     mut camera: Single<(&mut Transform, &mut Projection), With<Camera>>,
     mut layouts: ResMut<Assets<TextureAtlasLayout>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
+    let font = &font.0;
+
     clear_color.0 = Color::BLACK;
 
     let Projection::Orthographic(perspective) = camera.1.as_mut() else {
@@ -134,7 +138,7 @@ fn setup_level(
             RigidBody::Dynamic,
             CollisionEventsEnabled,
             Collider::rectangle(16.0, 16.0),
-            Mass(1.0),
+            Mass(1800.0),
             Sprite::from_atlas_image(
                 texture,
                 TextureAtlas {
@@ -144,9 +148,13 @@ fn setup_level(
             ),
             PlayerState::Idle,
             Fuel(1000),
-            Transform::from_translation(Vec3::new(400.0, 500.0, 0.0)),
+            Transform {
+                rotation: Quat::from_rotation_z(PI / 2.0),
+                translation: Vec3::new(0.0, 850.0, 0.0),
+                ..Default::default()
+            },
             LinearVelocity {
-                0: Vec2::new(0.0, 0.0),
+                0: Vec2::new(80.0, 0.0),
             },
         ))
         .observe(player_crash_observer);
@@ -182,7 +190,7 @@ fn setup_level(
         DespawnOnExit(GameState::Game),
         Ground,
         RigidBody::Static,
-        Collider::polyline(ground_points, None),
+        Collider::polyline(ground_points, None), // TODO: should use heightfield or similar for performance
         Mesh2d(ground_mesh),
         MeshMaterial2d(materials.add(Color::WHITE)),
     ));
@@ -220,37 +228,78 @@ fn setup_level(
         Node {
             position_type: PositionType::Absolute,
             top: Val::Px(10.0),
-            left: Val::Px(10.0),
+            right: Val::Px(10.0),
             display: Display::Flex,
-            flex_direction: FlexDirection::Row,
+            flex_direction: FlexDirection::Column,
             column_gap: Val::Px(5.0),
             ..Default::default()
         },
         children![
             (
-                PlayerFuelText,
-                Text::new("Fuel: 100"),
+                HudText::TimePassed,
+                Text::new("TIME PASSED: 0.0 s"),
                 TextColor(Color::WHITE),
-                TextLayout::new_with_justify(Justify::Left),
+                TextLayout::new_with_justify(Justify::Right),
                 TextFont {
                     font_size: 16.0,
+                    font: font.clone(),
                     ..default()
                 },
             ),
             (
-                PlayerVelocityText,
-                Text::new("Horizontal velocity: 0.0 m/s, Vertical velocity: 0.0 m/s"),
+                HudText::Fuel,
+                Text::new("FUEL: 100"),
                 TextColor(Color::WHITE),
-                TextLayout::new_with_justify(Justify::Left),
+                TextLayout::new_with_justify(Justify::Right),
                 TextFont {
                     font_size: 16.0,
+                    font: font.clone(),
                     ..default()
                 },
-            )
+            ),
+            (
+                HudText::XVelocity,
+                Text::new("HORIZONTAL VELOCITY: 0.0 m/s"),
+                TextColor(Color::WHITE),
+                TextLayout::new_with_justify(Justify::Right),
+                TextFont {
+                    font_size: 16.0,
+                    font: font.clone(),
+                    ..default()
+                },
+            ),
+            (
+                HudText::YVelocity,
+                Text::new("VERTICAL VELOCITY: 0.0 m/s"),
+                TextColor(Color::WHITE),
+                TextLayout::new_with_justify(Justify::Right),
+                TextFont {
+                    font_size: 16.0,
+                    font: font.clone(),
+                    ..default()
+                },
+            ),
         ],
     ));
 
+    // TODO: this works, but terrain should be infinite and generated as the player moves
+    commands.spawn((
+        DespawnOnExit(GameState::Game),
+        Ground,
+        RigidBody::Static,
+        Collider::compound(vec![
+            (Vec2::new(0.0, 0.0), 0.0, Collider::half_space(Vec2::X)),
+            (Vec2::new(1600.0, 0.0), 0.0, Collider::half_space(-Vec2::X)),
+            (Vec2::new(0.0, 0.0), 0.0, Collider::half_space(Vec2::Y)),
+            (Vec2::new(0.0, 900.0), 0.0, Collider::half_space(-Vec2::Y)),
+        ]),
+    ));
+
     commands.insert_resource(WinTimer(Timer::from_seconds(3.0, TimerMode::Once)));
+
+    commands.insert_resource(TimePassed(Duration::ZERO));
+
+    commands.insert_resource(Gravity(Vec2::NEG_Y * 1.62))
 }
 
 fn cleanup_level(
@@ -266,6 +315,8 @@ fn cleanup_level(
     camera.0.translation = Vec2::new(0.0, 0.0).extend(camera.0.translation.z);
 
     commands.remove_resource::<WinTimer>();
+
+    commands.insert_resource(Gravity(Vec2::NEG_Y * 9.81));
 }
 
 fn end_input_system(
@@ -283,10 +334,10 @@ fn control_system(
     mut game_state: ResMut<NextState<GameState>>,
 ) {
     if keyboard_input.any_pressed([KeyCode::ArrowLeft, KeyCode::KeyA]) {
-        player.1.apply_angular_acceleration(2.0);
+        player.1.apply_angular_acceleration(3.0);
     }
     if keyboard_input.any_pressed([KeyCode::ArrowRight, KeyCode::KeyD]) {
-        player.1.apply_angular_acceleration(-2.0);
+        player.1.apply_angular_acceleration(-3.0);
     }
 
     if player.3.0 > 0 {
@@ -294,9 +345,9 @@ fn control_system(
             *player.2 = PlayerState::Firing;
         }
         if keyboard_input.pressed(KeyCode::Space) {
-            let acceleration_vector = (player.0.rotation * Vec3::Y * 100.0).truncate();
+            let force_vector = (player.0.rotation * Vec3::Y * 12000.0).truncate();
 
-            player.1.apply_linear_acceleration(acceleration_vector);
+            player.1.apply_force(force_vector);
             player.3.0 = player.3.0.saturating_sub(1);
         }
     }
@@ -327,20 +378,36 @@ fn animation_system(
     }
 }
 
+fn playtime_system(time: Res<Time>, mut time_passed: ResMut<TimePassed>) {
+    time_passed.0 += time.delta();
+}
+
 fn hud_system(
     player: Single<(&LinearVelocity, &Fuel), With<Player>>,
-    mut fuel_text: Single<&mut Text, With<PlayerFuelText>>,
-    mut velocity_text: Single<&mut Text, (With<PlayerVelocityText>, Without<PlayerFuelText>)>,
+    time_passed: Res<TimePassed>,
+    mut texts_query: Query<(&HudText, &mut Text)>,
 ) {
-    fuel_text.0 = format!("Fuel: {}", player.1.0);
-
-    let horizontal_velocity = player.0.0.x;
-    let vertical_velocity = player.0.0.y;
-
-    velocity_text.0 = format!(
-        "Horizontal velocity: {:.1} m/s, Vertical velocity: {:.1} m/s",
-        horizontal_velocity, vertical_velocity
-    );
+    for (kind, mut text) in &mut texts_query {
+        match kind {
+            HudText::Fuel => {
+                text.0 = format!("FUEL: {}", player.1.0);
+            }
+            HudText::XVelocity => {
+                let horizontal_velocity = player.0.0.x;
+                text.0 = format!("HORIZONTAL VELOCITY: {:.1} m/s", horizontal_velocity);
+            }
+            HudText::YVelocity => {
+                let vertical_velocity = player.0.0.y;
+                text.0 = format!("VERTICAL VELOCITY: {:.1} m/s", vertical_velocity);
+            }
+            HudText::TimePassed => {
+                let total_secs = time_passed.0.as_secs();
+                let minutes = total_secs / 60;
+                let seconds = total_secs % 60;
+                text.0 = format!("TIME PASSED: {:02}:{:02}", minutes, seconds);
+            }
+        }
+    }
 }
 
 fn player_entered_landing_zone(
@@ -448,7 +515,7 @@ fn player_crash_observer(
         impact_impulse_magnitude += contact_pair.total_normal_impulse_magnitude();
     }
 
-    if impact_impulse_magnitude > 50.0 {
+    if impact_impulse_magnitude > 15000.0 {
         game_phase.set(GamePhase::Lose);
     }
 }
@@ -493,6 +560,12 @@ fn reset_win_timer_system(
     }
 }
 
+fn fuel_weight_system(mut player: Single<(&mut Mass, &Fuel), (With<Player>, Changed<Fuel>)>) {
+    let empty_mass = 800.0;
+    let fuel_mass = player.1.0 as f32;
+    player.0.0 = empty_mass + fuel_mass;
+}
+
 fn setup_lose_screen(
     mut commands: Commands,
     mut player: Single<
@@ -504,7 +577,10 @@ fn setup_lose_screen(
         ),
         With<Player>,
     >,
+    font: Res<MainFont>,
 ) {
+    let font = &font.0;
+
     *player.1 = PlayerState::Crashed;
     player.2.0 = Vec2::ZERO;
     player.3.0 = 0.0;
@@ -527,6 +603,7 @@ fn setup_lose_screen(
             TextLayout::new_with_justify(Justify::Center),
             TextFont {
                 font_size: 48.0,
+                font: font.clone(),
                 ..default()
             },
         )],
@@ -535,7 +612,13 @@ fn setup_lose_screen(
 
 fn cleanup_lose_screen(mut _commands: Commands) {}
 
-fn setup_win_screen(mut commands: Commands, player: Single<&ScoreMultiplier, With<Player>>) {
+fn setup_win_screen(
+    mut commands: Commands,
+    player: Single<&ScoreMultiplier, With<Player>>,
+    font: Res<MainFont>,
+) {
+    let font = &font.0;
+
     commands.spawn((
         DespawnOnExit(GamePhase::Win),
         Node {
@@ -556,6 +639,7 @@ fn setup_win_screen(mut commands: Commands, player: Single<&ScoreMultiplier, Wit
             TextLayout::new_with_justify(Justify::Center),
             TextFont {
                 font_size: 48.0,
+                font: font.clone(),
                 ..default()
             },
         )],

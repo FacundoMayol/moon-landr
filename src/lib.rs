@@ -11,6 +11,9 @@ enum GameState {
     Game,
 }
 
+#[derive(Resource)]
+pub struct MainFont(Handle<Font>);
+
 pub struct GameAppPlugin;
 
 impl Plugin for GameAppPlugin {
@@ -22,8 +25,12 @@ impl Plugin for GameAppPlugin {
     }
 }
 
-fn setup(mut commands: Commands) {
+fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+    let font = asset_server.load("fonts/Questrial-Regular.ttf");
+
     commands.spawn(Camera2d);
 
     commands.insert_resource(ClearColor(Color::BLACK));
+
+    commands.insert_resource(MainFont(font));
 }

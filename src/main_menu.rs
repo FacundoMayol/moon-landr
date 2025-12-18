@@ -119,7 +119,10 @@ fn main_menu_setup(
     mut commands: Commands,
     mut clear_color: ResMut<ClearColor>,
     _asset_server: Res<AssetServer>,
+    font_family: Res<MainFont>,
 ) {
+    let font_family = &font_family.0;
+
     let button_node = Node {
         width: px(300),
         height: px(65),
@@ -129,20 +132,11 @@ fn main_menu_setup(
         border: UiRect::all(px(2)),
         ..default()
     };
-    /*let button_icon_node = Node {
-        width: px(30),
-        position_type: PositionType::Absolute,
-        left: px(10),
-        ..default()
-    };*/
     let button_text_font = TextFont {
         font_size: 33.0,
+        font: font_family.clone(),
         ..default()
     };
-
-    /*let right_icon = asset_server.load("textures/Game Icons/right.png");
-    let wrench_icon = asset_server.load("textures/Game Icons/wrench.png");
-    let exit_icon = asset_server.load("textures/Game Icons/exitRight.png");*/
 
     clear_color.0 = BLACK.into();
 
@@ -167,6 +161,7 @@ fn main_menu_setup(
                     Text::new("Moon Landr"),
                     TextFont {
                         font_size: 67.0,
+                        font: font_family.clone(),
                         ..default()
                     },
                     TextColor(TEXT_COLOR),
@@ -181,14 +176,11 @@ fn main_menu_setup(
                     BackgroundColor(NORMAL_BUTTON),
                     BorderColor::all(TEXT_COLOR),
                     MenuButtonAction::Play,
-                    children![
-                        //(ImageNode::new(right_icon), button_icon_node.clone()),
-                        (
-                            Text::new("New Game"),
-                            button_text_font.clone(),
-                            TextColor(TEXT_COLOR),
-                        ),
-                    ]
+                    children![(
+                        Text::new("New Game"),
+                        button_text_font.clone(),
+                        TextColor(TEXT_COLOR),
+                    ),]
                 ),
                 /*(
                     Button,
@@ -196,7 +188,6 @@ fn main_menu_setup(
                     BackgroundColor(NORMAL_BUTTON),
                     MenuButtonAction::Settings,
                     children![
-                        (ImageNode::new(wrench_icon), button_icon_node.clone()),
                         (
                             Text::new("Settings"),
                             button_text_font.clone(),
@@ -210,10 +201,7 @@ fn main_menu_setup(
                     BackgroundColor(NORMAL_BUTTON),
                     BorderColor::all(TEXT_COLOR),
                     MenuButtonAction::Quit,
-                    children![
-                        //(ImageNode::new(exit_icon), button_icon_node),
-                        (Text::new("Quit"), button_text_font, TextColor(TEXT_COLOR),),
-                    ]
+                    children![(Text::new("Quit"), button_text_font, TextColor(TEXT_COLOR),),]
                 ),
             ]
         )],
@@ -238,17 +226,7 @@ fn menu_action(
                 MenuButtonAction::Play => {
                     game_state.set(GameState::Game);
                     menu_state.set(MenuState::Disabled);
-                } /*MenuButtonAction::Settings => menu_state.set(MenuState::Settings),
-                  MenuButtonAction::SettingsDisplay => {
-                      menu_state.set(MenuState::SettingsDisplay);
-                  }
-                  MenuButtonAction::SettingsSound => {
-                      menu_state.set(MenuState::SettingsSound);
-                  }
-                  MenuButtonAction::BackToMainMenu => menu_state.set(MenuState::Main),
-                  MenuButtonAction::BackToSettings => {
-                      menu_state.set(MenuState::Settings);
-                  }*/
+                }
             }
         }
     }
