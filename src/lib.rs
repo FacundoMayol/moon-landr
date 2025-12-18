@@ -26,7 +26,7 @@ impl Plugin for GameAppPlugin {
 }
 
 fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
-    let font = asset_server.load("fonts/Questrial-Regular.ttf");
+    let font = asset_server.load("fonts/Montserrat-Thin.ttf");
 
     commands.spawn(Camera2d);
 

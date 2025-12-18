@@ -2,8 +2,8 @@ use crate::*;
 
 use avian2d::{math::PI, prelude::*};
 use bevy::{camera::ScalingMode, prelude::*};
-//use bevy_math::prelude::*;
 use noiz::prelude::*;
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::{
     fmt::Debug,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -62,9 +62,72 @@ struct Ground;
 struct Grounded(bool);
 
 #[derive(Component, Debug, Clone, Copy, PartialEq)]
+struct TerrainChunk {
+    x_origin: f32,
+}
+
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
 struct LandPad {
     score_multiplier: f32,
 }
+
+type TerrainNoiseType = Noise<
+    LayeredNoise<
+        Normed<f32>,
+        Persistence,
+        FractalLayers<Octave<MixCellGradients<OrthoGrid, Smoothstep, QuickGradients>>>,
+    >,
+>;
+
+#[derive(Resource)]
+struct TerrainNoiseGenerator(TerrainNoiseType);
+
+#[derive(Resource)]
+struct TerrainMaterial(Handle<ColorMaterial>);
+
+#[derive(Resource)]
+struct GameSounds {
+    thrust_sound: Handle<AudioSource>,
+    crash_sound: Handle<AudioSource>,
+    landing_sound: Handle<AudioSource>,
+}
+
+#[derive(Component)]
+enum GameSound {
+    Thrust,
+    Crash,
+    Landing,
+}
+
+const GRAVITY: Vec2 = Vec2::new(0.0, -1.62);
+const THRUST: f32 = 12000.0;
+const ROTATION_THRUST: f32 = 3.0;
+const FUEL_CONSUMPTION_RATE: u32 = 1;
+const SAFE_LANDING_IMPULSE_MAGNITUDE: f32 = 15000.0;
+const FUEL_MASS_FACTOR: f32 = 1.0;
+const DRY_LANDER_MASS: f32 = 800.0;
+const MAX_FUEL: u32 = 1000;
+
+const CHUNK_BUFFER_OUTSIDE_VIEWPORT_COUNT: i32 = 3;
+const CHUNK_WIDTH: f32 = 400.0;
+const CHUNK_GRANULARITY: u32 = 2; // units per sample point
+const CHUNK_NOISE_LAYERS: u32 = 12;
+const CHUNK_NOISE_PERSISTENCE: f32 = 0.6;
+const CHUNK_NOISE_LACUNARITY: f32 = 2.0;
+//const CHUNK_NOISE_PERIOD: f32 = CHUNK_WIDTH / CHUNK_GRANULARITY as f32;
+const CHUNK_NOISE_FREQUENCY: f32 = CHUNK_GRANULARITY as f32 / CHUNK_WIDTH;
+const CHUNK_HEIGHT_AMPLITUDE: f32 = 300.0;
+const CHUNK_BASE_HEIGHT: f32 = 300.0;
+
+const CAMERA_VIEWPORT_WIDTH: f32 = 1600.0;
+const CAMERA_VIEWPORT_HEIGHT: f32 = 900.0;
+
+const LANDER_SIZE: UVec2 = UVec2::new(16, 16);
+const LAND_PAD_WIDTH: u32 = 24; // in world units
+
+const INITIAL_HORIZONTAL_SPEED: f32 = 50.0;
+
+const WIN_TIMER_DURATION: f32 = 3.0;
 
 pub(crate) fn plugin(app: &mut App) {
     app.add_sub_state::<GamePhase>()
@@ -75,6 +138,9 @@ pub(crate) fn plugin(app: &mut App) {
                 (
                     (
                         control_system,
+                        audio_system,
+                        terrain_chunk_system,
+                        camera_follow_system,
                         ground_detection_system,
                         start_win_timer_system,
                         reset_win_timer_system,
@@ -105,8 +171,8 @@ fn setup_level(
     font: Res<MainFont>,
     mut camera: Single<(&mut Transform, &mut Projection), With<Camera>>,
     mut layouts: ResMut<Assets<TextureAtlasLayout>>,
-    mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    /*mut meshes: ResMut<Assets<Mesh>>,*/
 ) {
     let font = &font.0;
 
@@ -116,16 +182,16 @@ fn setup_level(
         return;
     };
 
-    perspective.scaling_mode = ScalingMode::AutoMax {
-        max_width: 1600.0,
-        max_height: 900.0,
+    perspective.scaling_mode = ScalingMode::Fixed {
+        width: CAMERA_VIEWPORT_WIDTH,
+        height: CAMERA_VIEWPORT_HEIGHT,
     };
 
-    camera.0.translation = Vec2::new(800.0, 450.0).extend(camera.0.translation.z);
-
+    camera.0.translation = Vec2::new(CAMERA_VIEWPORT_WIDTH / 2.0, CAMERA_VIEWPORT_HEIGHT / 2.0)
+        .extend(camera.0.translation.z);
     let texture = asset_server.load("sprites/lander.png");
 
-    let layout = TextureAtlasLayout::from_grid(UVec2::new(16, 16), 3, 1, None, None);
+    let layout = TextureAtlasLayout::from_grid(LANDER_SIZE, 3, 1, None, None);
 
     let layout_handle = layouts.add(layout);
 
@@ -137,8 +203,8 @@ fn setup_level(
             ScoreMultiplier(1.0),
             RigidBody::Dynamic,
             CollisionEventsEnabled,
-            Collider::rectangle(16.0, 16.0),
-            Mass(1800.0),
+            Collider::rectangle(LANDER_SIZE.x as f32, LANDER_SIZE.y as f32),
+            Mass(DRY_LANDER_MASS + (MAX_FUEL as f32 * FUEL_MASS_FACTOR)),
             Sprite::from_atlas_image(
                 texture,
                 TextureAtlas {
@@ -147,14 +213,14 @@ fn setup_level(
                 },
             ),
             PlayerState::Idle,
-            Fuel(1000),
+            Fuel(MAX_FUEL),
             Transform {
                 rotation: Quat::from_rotation_z(PI / 2.0),
                 translation: Vec3::new(0.0, 850.0, 0.0),
                 ..Default::default()
             },
             LinearVelocity {
-                0: Vec2::new(80.0, 0.0),
+                0: Vec2::new(INITIAL_HORIZONTAL_SPEED, 0.0),
             },
         ))
         .observe(player_crash_observer);
@@ -164,19 +230,26 @@ fn setup_level(
         .unwrap()
         .as_nanos() as u32;
 
-    let mut noise_generator = Noise::from(LayeredNoise::new(
+    let mut terrain_noise_generator: TerrainNoiseType = Noise::from(LayeredNoise::new(
         Normed::<f32>::default(),
-        Persistence(0.7),
+        Persistence(CHUNK_NOISE_PERSISTENCE),
         FractalLayers {
             layer: Octave::<MixCellGradients<OrthoGrid, Smoothstep, QuickGradients>>::default(),
-            lacunarity: 2.0,
-            amount: 12,
+            lacunarity: CHUNK_NOISE_LACUNARITY,
+            amount: CHUNK_NOISE_LAYERS,
         },
     ));
-    noise_generator.set_seed(seed);
-    noise_generator.set_period(800.0);
+    terrain_noise_generator.set_seed(seed);
+    //noise_generator.set_period(CHUNK_NOISE_PERIOD);
+    terrain_noise_generator.set_frequency(CHUNK_NOISE_FREQUENCY);
 
-    let ground_points: Vec<Vec2> = (0..800)
+    commands.insert_resource(TerrainNoiseGenerator(terrain_noise_generator));
+
+    let terrain_material = materials.add(Color::WHITE);
+
+    commands.insert_resource(TerrainMaterial(terrain_material));
+
+    /*let ground_points: Vec<Vec2> = (0..800)
         .map(|x| {
             let height =
                 noise_generator.sample_for::<f32>(Vec2::new(x as f32, 0.0)) * 500.0 + 300.0;
@@ -222,6 +295,19 @@ fn setup_level(
                 MeshMaterial2d(materials.add(Color::WHITE)),
             ));
         });
+
+    // TODO: this works, but terrain should be infinite and generated as the player moves
+    commands.spawn((
+        DespawnOnExit(GameState::Game),
+        Ground,
+        RigidBody::Static,
+        Collider::compound(vec![
+            (Vec2::new(0.0, 0.0), 0.0, Collider::half_space(Vec2::X)),
+            (Vec2::new(1600.0, 0.0), 0.0, Collider::half_space(-Vec2::X)),
+            (Vec2::new(0.0, 0.0), 0.0, Collider::half_space(Vec2::Y)),
+            (Vec2::new(0.0, 900.0), 0.0, Collider::half_space(-Vec2::Y)),
+        ]),
+    ));*/
 
     commands.spawn((
         DespawnOnExit(GameState::Game),
@@ -282,24 +368,20 @@ fn setup_level(
         ],
     ));
 
-    // TODO: this works, but terrain should be infinite and generated as the player moves
-    commands.spawn((
-        DespawnOnExit(GameState::Game),
-        Ground,
-        RigidBody::Static,
-        Collider::compound(vec![
-            (Vec2::new(0.0, 0.0), 0.0, Collider::half_space(Vec2::X)),
-            (Vec2::new(1600.0, 0.0), 0.0, Collider::half_space(-Vec2::X)),
-            (Vec2::new(0.0, 0.0), 0.0, Collider::half_space(Vec2::Y)),
-            (Vec2::new(0.0, 900.0), 0.0, Collider::half_space(-Vec2::Y)),
-        ]),
-    ));
-
-    commands.insert_resource(WinTimer(Timer::from_seconds(3.0, TimerMode::Once)));
+    commands.insert_resource(WinTimer(Timer::from_seconds(
+        WIN_TIMER_DURATION,
+        TimerMode::Once,
+    )));
 
     commands.insert_resource(TimePassed(Duration::ZERO));
 
-    commands.insert_resource(Gravity(Vec2::NEG_Y * 1.62))
+    commands.insert_resource(GameSounds {
+        thrust_sound: asset_server.load("sounds/engine.wav"),
+        crash_sound: asset_server.load("sounds/explosion.wav"),
+        landing_sound: asset_server.load("sounds/win.wav"),
+    });
+
+    commands.insert_resource(Gravity(GRAVITY));
 }
 
 fn cleanup_level(
@@ -316,7 +398,190 @@ fn cleanup_level(
 
     commands.remove_resource::<WinTimer>();
 
+    commands.remove_resource::<TimePassed>();
+
+    commands.remove_resource::<TerrainNoiseGenerator>();
+
+    commands.remove_resource::<TerrainMaterial>();
+
+    commands.remove_resource::<GameSounds>();
+
     commands.insert_resource(Gravity(Vec2::NEG_Y * 9.81));
+}
+
+fn create_terrain_chunk(
+    commands: &mut Commands,
+    x_origin: f32,
+    terrain_noise_generator: &TerrainNoiseGenerator,
+    terrain_material: &Handle<ColorMaterial>,
+    font: &Handle<Font>,
+    meshes: &mut ResMut<Assets<Mesh>>,
+) {
+    let mut ground_heights: Vec<f32> = (0..=CHUNK_WIDTH as i32)
+        .step_by(CHUNK_GRANULARITY as usize)
+        .map(|x| {
+            terrain_noise_generator
+                .0
+                .sample_for::<f32>(Vec2::new(x_origin + x as f32, 0.0))
+                * CHUNK_HEIGHT_AMPLITUDE
+                + CHUNK_BASE_HEIGHT
+        })
+        .collect();
+
+    let seed = x_origin;
+    let mut rng = StdRng::seed_from_u64(seed as u64);
+
+    let mut land_pad: Option<Vec2> = None;
+
+    const LAND_PAD_WINDOW: usize = (LAND_PAD_WIDTH / CHUNK_GRANULARITY) as usize;
+
+    if rng.random_bool(0.7) {
+        for i in 1..(ground_heights.len() - LAND_PAD_WINDOW) {
+            let x_0 = i;
+            let x_1 = i + LAND_PAD_WINDOW;
+
+            if (ground_heights[x_0] - ground_heights[x_1]).abs() <= 4.0 {
+                let pad_height = (ground_heights[x_0] + ground_heights[x_1]) / 2.0;
+                for x in x_0..=x_1 {
+                    ground_heights[x] = pad_height;
+                }
+                let pad_x = (x_0 as f32 + x_1 as f32) * CHUNK_GRANULARITY as f32 / 2.0;
+                land_pad = Some(Vec2::new(pad_x, pad_height));
+                break;
+            }
+        }
+    }
+
+    let ground_points: Vec<Vec2> = ground_heights
+        .iter()
+        .enumerate()
+        .map(|(x, &height)| Vec2::new((x * CHUNK_GRANULARITY as usize) as f32, height))
+        .collect();
+
+    let ground_mesh = meshes.add(Polyline2d::new(ground_points.clone()));
+
+    let mut chunk = commands.spawn((
+        DespawnOnExit(GameState::Game),
+        Ground,
+        TerrainChunk { x_origin },
+        RigidBody::Static,
+        //Collider::heightfield(ground_heights, Vec2::new(1.0, 1.0)),
+        Collider::polyline(ground_points, None), // TODO: should use heightfield or similar for performance
+        Mesh2d(ground_mesh),
+        MeshMaterial2d(terrain_material.clone()),
+        Transform::from_translation(Vec3::new(x_origin, 0.0, 0.0)),
+    ));
+
+    if let Some(pad_pos) = land_pad {
+        chunk.with_children(|parent| {
+            parent
+                .spawn((
+                    LandPad {
+                        score_multiplier: 3.0,
+                    },
+                    RigidBody::Static,
+                    Sensor,
+                    CollisionEventsEnabled,
+                    Collider::rectangle(LAND_PAD_WIDTH as f32, 16.0),
+                    Transform::from_translation(Vec3::new(pad_pos.x, pad_pos.y + 8.0, 0.0)),
+                    Visibility::default(),
+                ))
+                .observe(player_entered_landing_zone)
+                .observe(player_exited_landing_zone)
+                .with_child((
+                    Text2d::new(format!("x{:.1}", 3.0)),
+                    TextFont {
+                        font_size: 14.0,
+                        font: font.clone(),
+                        ..default()
+                    },
+                    TextLayout::new_with_justify(Justify::Center),
+                    TextColor(Color::WHITE),
+                    Transform::from_translation(Vec3::new(0.0, 16.0, 0.0)),
+                ));
+        });
+    }
+}
+
+fn terrain_chunk_system(
+    mut commands: Commands,
+    player: Single<&Transform, With<Player>>,
+    existing_chunks: Query<(Entity, &TerrainChunk)>,
+    terrain_noise_generator: Res<TerrainNoiseGenerator>,
+    terrain_material: Res<TerrainMaterial>,
+    font: Res<MainFont>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    let player_x = player.translation.x;
+    let current_chunk_x_origin: i32 = ((player_x / CHUNK_WIDTH).floor() * CHUNK_WIDTH) as i32;
+
+    const CHUNKS_IN_CAMERA_VIEWPORT: i32 = (CAMERA_VIEWPORT_WIDTH / CHUNK_WIDTH).ceil() as i32 + 2; // +2 for buffer on each side
+
+    let needed_chunk_origins: Vec<i32> = ((-CHUNK_BUFFER_OUTSIDE_VIEWPORT_COUNT
+        - CHUNKS_IN_CAMERA_VIEWPORT / 2)
+        ..(CHUNKS_IN_CAMERA_VIEWPORT / 2 + CHUNK_BUFFER_OUTSIDE_VIEWPORT_COUNT))
+        .map(|i| current_chunk_x_origin + (i * CHUNK_WIDTH as i32))
+        .collect::<Vec<i32>>();
+
+    // Remove chunks that are no longer needed
+    for (entity, chunk) in existing_chunks.iter() {
+        let chunk_x_origin_i32 = chunk.x_origin as i32;
+        if !needed_chunk_origins.contains(&chunk_x_origin_i32) {
+            commands.entity(entity).despawn();
+        }
+    }
+
+    let exisitng_chunk_origins: Vec<i32> = existing_chunks
+        .iter()
+        .map(|(_, chunk)| chunk.x_origin as i32)
+        .collect::<Vec<i32>>();
+
+    let chunks_to_add: Vec<f32> = needed_chunk_origins
+        .iter()
+        .cloned()
+        .filter_map(|x_origin| {
+            if !exisitng_chunk_origins.contains(&x_origin) {
+                Some(x_origin as f32)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<f32>>();
+
+    for x_origin in chunks_to_add {
+        create_terrain_chunk(
+            &mut commands,
+            x_origin,
+            &terrain_noise_generator,
+            &terrain_material.0,
+            &font.0,
+            &mut meshes,
+        );
+    }
+}
+
+fn camera_follow_system(
+    player: Single<&Transform, With<Player>>,
+    mut camera: Single<(&mut Transform, &Projection), (With<Camera>, Without<Player>)>,
+    window: Single<&Window>,
+) {
+    let Projection::Orthographic(perspective) = camera.1 else {
+        return;
+    };
+
+    let viewport_size = Vec2::new(window.width(), window.height()) * perspective.scale;
+
+    let center = camera.0.translation.truncate();
+    let quarter_size = viewport_size / 4.0;
+
+    let min = center - quarter_size;
+    let max = center + quarter_size;
+
+    if player.translation.x < min.x {
+        camera.0.translation.x = player.translation.x + quarter_size.x;
+    } else if player.translation.x > max.x {
+        camera.0.translation.x = player.translation.x - quarter_size.x;
+    }
 }
 
 fn end_input_system(
@@ -334,10 +599,10 @@ fn control_system(
     mut game_state: ResMut<NextState<GameState>>,
 ) {
     if keyboard_input.any_pressed([KeyCode::ArrowLeft, KeyCode::KeyA]) {
-        player.1.apply_angular_acceleration(3.0);
+        player.1.apply_angular_acceleration(ROTATION_THRUST);
     }
     if keyboard_input.any_pressed([KeyCode::ArrowRight, KeyCode::KeyD]) {
-        player.1.apply_angular_acceleration(-3.0);
+        player.1.apply_angular_acceleration(-ROTATION_THRUST);
     }
 
     if player.3.0 > 0 {
@@ -345,10 +610,10 @@ fn control_system(
             *player.2 = PlayerState::Firing;
         }
         if keyboard_input.pressed(KeyCode::Space) {
-            let force_vector = (player.0.rotation * Vec3::Y * 12000.0).truncate();
+            let force_vector = (player.0.rotation * Vec3::Y * THRUST).truncate();
 
             player.1.apply_force(force_vector);
-            player.3.0 = player.3.0.saturating_sub(1);
+            player.3.0 = player.3.0.saturating_sub(FUEL_CONSUMPTION_RATE);
         }
     }
     if (keyboard_input.just_released(KeyCode::Space) && *player.2 == PlayerState::Firing)
@@ -374,6 +639,35 @@ fn animation_system(
         }
         PlayerState::Crashed => {
             player.1.texture_atlas.as_mut().unwrap().index = 2;
+        }
+    }
+}
+
+fn audio_system(
+    mut commands: Commands,
+    player: Single<&PlayerState, (With<Player>, Changed<PlayerState>)>,
+    game_sounds: Res<GameSounds>,
+    sounds_query: Query<(Entity, &AudioSink, &GameSound)>,
+) {
+    match *player {
+        PlayerState::Firing => {
+            commands.spawn((
+                DespawnOnExit(GamePhase::Running),
+                GameSound::Thrust,
+                AudioPlayer::new(game_sounds.thrust_sound.clone()),
+                PlaybackSettings::LOOP,
+            ));
+        }
+        _ => {
+            for (entity, sink, sound) in &sounds_query {
+                match sound {
+                    GameSound::Thrust => {
+                        sink.stop();
+                        commands.entity(entity).despawn();
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -515,7 +809,7 @@ fn player_crash_observer(
         impact_impulse_magnitude += contact_pair.total_normal_impulse_magnitude();
     }
 
-    if impact_impulse_magnitude > 15000.0 {
+    if impact_impulse_magnitude > SAFE_LANDING_IMPULSE_MAGNITUDE {
         game_phase.set(GamePhase::Lose);
     }
 }
@@ -561,8 +855,8 @@ fn reset_win_timer_system(
 }
 
 fn fuel_weight_system(mut player: Single<(&mut Mass, &Fuel), (With<Player>, Changed<Fuel>)>) {
-    let empty_mass = 800.0;
-    let fuel_mass = player.1.0 as f32;
+    let empty_mass = DRY_LANDER_MASS;
+    let fuel_mass = player.1.0 as f32 * FUEL_MASS_FACTOR;
     player.0.0 = empty_mass + fuel_mass;
 }
 
@@ -578,6 +872,7 @@ fn setup_lose_screen(
         With<Player>,
     >,
     font: Res<MainFont>,
+    game_sounds: Res<GameSounds>,
 ) {
     let font = &font.0;
 
@@ -608,6 +903,13 @@ fn setup_lose_screen(
             },
         )],
     ));
+
+    commands.spawn((
+        DespawnOnExit(GamePhase::Lose),
+        GameSound::Crash,
+        AudioPlayer::new(game_sounds.crash_sound.clone()),
+        PlaybackSettings::DESPAWN,
+    ));
 }
 
 fn cleanup_lose_screen(mut _commands: Commands) {}
@@ -616,6 +918,7 @@ fn setup_win_screen(
     mut commands: Commands,
     player: Single<&ScoreMultiplier, With<Player>>,
     font: Res<MainFont>,
+    game_sounds: Res<GameSounds>,
 ) {
     let font = &font.0;
 
@@ -643,6 +946,13 @@ fn setup_win_screen(
                 ..default()
             },
         )],
+    ));
+
+    commands.spawn((
+        DespawnOnExit(GamePhase::Win),
+        GameSound::Landing,
+        AudioPlayer::new(game_sounds.landing_sound.clone()),
+        PlaybackSettings::DESPAWN,
     ));
 }
 
