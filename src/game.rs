@@ -1,7 +1,13 @@
 use crate::*;
 
 use avian2d::{math::PI, prelude::*};
-use bevy::{camera::ScalingMode, prelude::*};
+use bevy::{
+    asset::RenderAssetUsages,
+    camera::ScalingMode,
+    mesh::{Indices, PrimitiveTopology},
+    prelude::*,
+    render::render_resource::{Extent3d, TextureDimension, TextureFormat},
+};
 use noiz::prelude::*;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::{
@@ -25,20 +31,20 @@ enum GamePhase {
     Lose,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component)]
 struct Player;
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component, PartialEq, Eq)]
 enum PlayerState {
     Idle,
     Firing,
     Crashed,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component)]
 struct Fuel(u32);
 
-#[derive(Component, Debug, Clone, Copy, PartialEq)]
+#[derive(Component)]
 struct ScoreMultiplier(f32);
 
 #[derive(Resource)]
@@ -55,18 +61,18 @@ enum HudText {
     TimePassed,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component)]
 struct Ground;
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component)]
 struct Grounded(bool);
 
-#[derive(Component, Debug, Clone, Copy, PartialEq)]
+#[derive(Component)]
 struct TerrainChunk {
     x_origin: f32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq)]
+#[derive(Component)]
 struct LandPad {
     score_multiplier: f32,
 }
@@ -86,6 +92,9 @@ struct TerrainNoiseGenerator(TerrainNoiseType);
 struct TerrainMaterial(Handle<ColorMaterial>);
 
 #[derive(Resource)]
+struct OccluderMaterial(Handle<ColorMaterial>);
+
+#[derive(Resource)]
 struct GameSounds {
     thrust_sound: Handle<AudioSource>,
     crash_sound: Handle<AudioSource>,
@@ -98,6 +107,9 @@ enum GameSound {
     Crash,
     Landing,
 }
+
+#[derive(Component)]
+struct BackgroundSky;
 
 const GRAVITY: Vec2 = Vec2::new(0.0, -1.62);
 const THRUST: f32 = 12000.0;
@@ -112,12 +124,12 @@ const CHUNK_BUFFER_OUTSIDE_VIEWPORT_COUNT: i32 = 3;
 const CHUNK_WIDTH: f32 = 400.0;
 const CHUNK_GRANULARITY: u32 = 2; // units per sample point
 const CHUNK_NOISE_LAYERS: u32 = 12;
-const CHUNK_NOISE_PERSISTENCE: f32 = 0.6;
+const CHUNK_NOISE_PERSISTENCE: f32 = 0.7;
 const CHUNK_NOISE_LACUNARITY: f32 = 2.0;
 //const CHUNK_NOISE_PERIOD: f32 = CHUNK_WIDTH / CHUNK_GRANULARITY as f32;
 const CHUNK_NOISE_FREQUENCY: f32 = CHUNK_GRANULARITY as f32 / CHUNK_WIDTH;
-const CHUNK_HEIGHT_AMPLITUDE: f32 = 300.0;
-const CHUNK_BASE_HEIGHT: f32 = 300.0;
+const CHUNK_HEIGHT_AMPLITUDE: f32 = 400.0;
+const CHUNK_BASE_HEIGHT: f32 = 400.0;
 
 const CAMERA_VIEWPORT_WIDTH: f32 = 1600.0;
 const CAMERA_VIEWPORT_HEIGHT: f32 = 900.0;
@@ -128,6 +140,8 @@ const LAND_PAD_WIDTH: u32 = 24; // in world units
 const INITIAL_HORIZONTAL_SPEED: f32 = 50.0;
 
 const WIN_TIMER_DURATION: f32 = 3.0;
+
+const STAR_DENSITY: f32 = 0.0005;
 
 pub(crate) fn plugin(app: &mut App) {
     app.add_sub_state::<GamePhase>()
@@ -172,15 +186,16 @@ fn setup_level(
     mut camera: Single<(&mut Transform, &mut Projection), With<Camera>>,
     mut layouts: ResMut<Assets<TextureAtlasLayout>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     /*mut meshes: ResMut<Assets<Mesh>>,*/
 ) {
-    let font = &font.0;
-
-    clear_color.0 = Color::BLACK;
-
     let Projection::Orthographic(perspective) = camera.1.as_mut() else {
         return;
     };
+
+    let font = &font.0;
+
+    clear_color.0 = Color::BLACK;
 
     perspective.scaling_mode = ScalingMode::Fixed {
         width: CAMERA_VIEWPORT_WIDTH,
@@ -240,14 +255,13 @@ fn setup_level(
         },
     ));
     terrain_noise_generator.set_seed(seed);
-    //noise_generator.set_period(CHUNK_NOISE_PERIOD);
     terrain_noise_generator.set_frequency(CHUNK_NOISE_FREQUENCY);
 
     commands.insert_resource(TerrainNoiseGenerator(terrain_noise_generator));
 
-    let terrain_material = materials.add(Color::WHITE);
+    commands.insert_resource(TerrainMaterial(materials.add(Color::WHITE)));
 
-    commands.insert_resource(TerrainMaterial(terrain_material));
+    commands.insert_resource(OccluderMaterial(materials.add(Color::BLACK)));
 
     /*let ground_points: Vec<Vec2> = (0..800)
         .map(|x| {
@@ -368,6 +382,55 @@ fn setup_level(
         ],
     ));
 
+    let mut rng = StdRng::seed_from_u64(seed as u64);
+
+    // RGBA8 texture
+    let mut data =
+        vec![0; (CAMERA_VIEWPORT_WIDTH as u32 * CAMERA_VIEWPORT_HEIGHT as u32 * 4) as usize];
+
+    for y in 0..CAMERA_VIEWPORT_HEIGHT as u32 {
+        for x in 0..CAMERA_VIEWPORT_WIDTH as u32 {
+            let i = ((y * CAMERA_VIEWPORT_WIDTH as u32 + x) * 4) as usize;
+
+            if rng.random::<f32>() < STAR_DENSITY {
+                // white star
+                data[i] = 255;
+                data[i + 1] = 255;
+                data[i + 2] = 255;
+                data[i + 3] = 255;
+            } else {
+                // black background
+                data[i + 3] = 255;
+            }
+        }
+    }
+
+    let image = Image::new_fill(
+        Extent3d {
+            width: CAMERA_VIEWPORT_WIDTH as u32,
+            height: CAMERA_VIEWPORT_HEIGHT as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+
+    commands.spawn((
+        DespawnOnExit(GameState::Game),
+        BackgroundSky,
+        Sprite::from_image(images.add(image)),
+        Transform {
+            translation: Vec3::new(
+                CAMERA_VIEWPORT_WIDTH / 2.0,
+                CAMERA_VIEWPORT_HEIGHT / 2.0,
+                -1.0,
+            ),
+            ..Default::default()
+        },
+    ));
+
     commands.insert_resource(WinTimer(Timer::from_seconds(
         WIN_TIMER_DURATION,
         TimerMode::Once,
@@ -404,9 +467,38 @@ fn cleanup_level(
 
     commands.remove_resource::<TerrainMaterial>();
 
+    commands.remove_resource::<OccluderMaterial>();
+
     commands.remove_resource::<GameSounds>();
 
     commands.insert_resource(Gravity(Vec2::NEG_Y * 9.81));
+}
+
+fn terrain_mesh(heights: &[f32], width: f32) -> Mesh {
+    let mut positions = Vec::new();
+    let mut indices = Vec::new();
+
+    for (i, &h) in heights.iter().enumerate() {
+        let x = i as f32 * width;
+
+        positions.push([x, 0.0, 0.0]);
+        positions.push([x, h, 0.0]);
+    }
+
+    for i in 0..heights.len() - 1 {
+        let base = (i * 2) as u32;
+
+        indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
+
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_indices(Indices::U32(indices));
+
+    mesh
 }
 
 fn create_terrain_chunk(
@@ -414,6 +506,7 @@ fn create_terrain_chunk(
     x_origin: f32,
     terrain_noise_generator: &TerrainNoiseGenerator,
     terrain_material: &Handle<ColorMaterial>,
+    occluder_material: &Handle<ColorMaterial>,
     font: &Handle<Font>,
     meshes: &mut ResMut<Assets<Mesh>>,
 ) {
@@ -460,6 +553,8 @@ fn create_terrain_chunk(
 
     let ground_mesh = meshes.add(Polyline2d::new(ground_points.clone()));
 
+    let occluder_mesh = meshes.add(terrain_mesh(&ground_heights, CHUNK_GRANULARITY as f32));
+
     let mut chunk = commands.spawn((
         DespawnOnExit(GameState::Game),
         Ground,
@@ -469,7 +564,12 @@ fn create_terrain_chunk(
         Collider::polyline(ground_points, None), // TODO: should use heightfield or similar for performance
         Mesh2d(ground_mesh),
         MeshMaterial2d(terrain_material.clone()),
-        Transform::from_translation(Vec3::new(x_origin, 0.0, 0.0)),
+        Transform::from_translation(Vec3::new(x_origin + CHUNK_WIDTH as f32 / 2.0, 0.0, 0.0)),
+    ));
+
+    chunk.with_child((
+        Mesh2d(occluder_mesh),
+        MeshMaterial2d(occluder_material.clone()),
     ));
 
     if let Some(pad_pos) = land_pad {
@@ -509,6 +609,7 @@ fn terrain_chunk_system(
     existing_chunks: Query<(Entity, &TerrainChunk)>,
     terrain_noise_generator: Res<TerrainNoiseGenerator>,
     terrain_material: Res<TerrainMaterial>,
+    occluder_material: Res<OccluderMaterial>,
     font: Res<MainFont>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
@@ -554,6 +655,7 @@ fn terrain_chunk_system(
             x_origin,
             &terrain_noise_generator,
             &terrain_material.0,
+            &occluder_material.0,
             &font.0,
             &mut meshes,
         );
@@ -562,7 +664,11 @@ fn terrain_chunk_system(
 
 fn camera_follow_system(
     player: Single<&Transform, With<Player>>,
-    mut camera: Single<(&mut Transform, &Projection), (With<Camera>, Without<Player>)>,
+    mut background: Single<&mut Transform, (With<BackgroundSky>, Without<Player>)>,
+    mut camera: Single<
+        (&mut Transform, &Projection),
+        (With<Camera>, Without<Player>, Without<BackgroundSky>),
+    >,
     window: Single<&Window>,
 ) {
     let Projection::Orthographic(perspective) = camera.1 else {
@@ -582,6 +688,8 @@ fn camera_follow_system(
     } else if player.translation.x > max.x {
         camera.0.translation.x = player.translation.x - quarter_size.x;
     }
+
+    background.translation.x = camera.0.translation.x;
 }
 
 fn end_input_system(
