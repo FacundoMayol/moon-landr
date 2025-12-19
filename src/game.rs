@@ -126,7 +126,6 @@ const CHUNK_GRANULARITY: u32 = 2; // units per sample point
 const CHUNK_NOISE_LAYERS: u32 = 12;
 const CHUNK_NOISE_PERSISTENCE: f32 = 0.7;
 const CHUNK_NOISE_LACUNARITY: f32 = 2.0;
-//const CHUNK_NOISE_PERIOD: f32 = CHUNK_WIDTH / CHUNK_GRANULARITY as f32;
 const CHUNK_NOISE_FREQUENCY: f32 = CHUNK_GRANULARITY as f32 / CHUNK_WIDTH;
 const CHUNK_HEIGHT_AMPLITUDE: f32 = 400.0;
 const CHUNK_BASE_HEIGHT: f32 = 400.0;
@@ -135,7 +134,8 @@ const CAMERA_VIEWPORT_WIDTH: f32 = 1600.0;
 const CAMERA_VIEWPORT_HEIGHT: f32 = 900.0;
 
 const LANDER_SIZE: UVec2 = UVec2::new(16, 16);
-const LAND_PAD_WIDTH: u32 = 24; // in world units
+const LAND_PAD_WIDTHS: [u32; 3] = [16, 24, 32]; // in world units, for small, medium, large pads
+const LAND_PAD_MULTIPLIERS: [f32; 3] = [5.0, 3.0, 2.0];
 
 const INITIAL_HORIZONTAL_SPEED: f32 = 50.0;
 
@@ -524,22 +524,31 @@ fn create_terrain_chunk(
     let seed = x_origin;
     let mut rng = StdRng::seed_from_u64(seed as u64);
 
-    let mut land_pad: Option<Vec2> = None;
-
-    const LAND_PAD_WINDOW: usize = (LAND_PAD_WIDTH / CHUNK_GRANULARITY) as usize;
+    let mut land_pad: Option<(Vec2, u32, f32)> = None;
 
     if rng.random_bool(0.7) {
-        for i in 1..(ground_heights.len() - LAND_PAD_WINDOW) {
-            let x_0 = i;
-            let x_1 = i + LAND_PAD_WINDOW;
+        let land_pad_type_index = rng.random_range(0..LAND_PAD_WIDTHS.len());
 
+        let land_pad_width = LAND_PAD_WIDTHS[land_pad_type_index];
+
+        let land_pad_window: usize = (land_pad_width / CHUNK_GRANULARITY) as usize;
+
+        let land_pad_multiplier = LAND_PAD_MULTIPLIERS[land_pad_type_index];
+
+        for i in 1..(ground_heights.len() - land_pad_window) {
+            let x_0 = i;
+            let x_1 = i + land_pad_window;
             if (ground_heights[x_0] - ground_heights[x_1]).abs() <= 4.0 {
                 let pad_height = (ground_heights[x_0] + ground_heights[x_1]) / 2.0;
                 for x in x_0..=x_1 {
                     ground_heights[x] = pad_height;
                 }
                 let pad_x = (x_0 as f32 + x_1 as f32) * CHUNK_GRANULARITY as f32 / 2.0;
-                land_pad = Some(Vec2::new(pad_x, pad_height));
+                land_pad = Some((
+                    Vec2::new(pad_x, pad_height),
+                    land_pad_width,
+                    land_pad_multiplier,
+                ));
                 break;
             }
         }
@@ -577,27 +586,27 @@ fn create_terrain_chunk(
             parent
                 .spawn((
                     LandPad {
-                        score_multiplier: 3.0,
+                        score_multiplier: pad_pos.2,
                     },
                     RigidBody::Static,
                     Sensor,
                     CollisionEventsEnabled,
-                    Collider::rectangle(LAND_PAD_WIDTH as f32, 16.0),
-                    Transform::from_translation(Vec3::new(pad_pos.x, pad_pos.y + 8.0, 0.0)),
+                    Collider::rectangle(pad_pos.1 as f32, 16.0),
+                    Transform::from_translation(Vec3::new(pad_pos.0.x, pad_pos.0.y + 8.0, 0.0)),
                     Visibility::default(),
                 ))
                 .observe(player_entered_landing_zone)
                 .observe(player_exited_landing_zone)
                 .with_child((
-                    Text2d::new(format!("x{:.1}", 3.0)),
+                    Text2d::new(format!("x{:.1}", pad_pos.2)),
                     TextFont {
-                        font_size: 14.0,
+                        font_size: 12.0,
                         font: font.clone(),
                         ..default()
                     },
                     TextLayout::new_with_justify(Justify::Center),
                     TextColor(Color::WHITE),
-                    Transform::from_translation(Vec3::new(0.0, 16.0, 0.0)),
+                    Transform::from_translation(Vec3::new(0.0, -24.0, 0.0)),
                 ));
         });
     }
