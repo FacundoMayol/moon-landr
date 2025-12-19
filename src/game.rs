@@ -143,6 +143,13 @@ const WIN_TIMER_DURATION: f32 = 3.0;
 
 const STAR_DENSITY: f32 = 0.0005;
 
+const MAX_TIME_SCORE_BONUS: f32 = 1000.0;
+const TIME_SCORE_BONUS_REDUCTION_FACTOR: f32 = MAX_TIME_SCORE_BONUS / 200.0; // reduces to zero at 200 seconds
+
+const FUEL_SCORE_BONUS_FACTOR: f32 = 2.0; // each unit of fuel left gives this much score
+
+const MAX_HEIGHT_SCORE_BONUS_FACTOR: f32 = 1.0; // each unit of height at landing gives this much score
+
 pub(crate) fn plugin(app: &mut App) {
     app.add_sub_state::<GamePhase>()
         .add_systems(OnEnter(GameState::Game), setup_level)
@@ -1018,6 +1025,7 @@ fn setup_lose_screen(
                 font: font.clone(),
                 ..default()
             },
+            TextBackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.8)),
         )],
     ));
 
@@ -1033,11 +1041,18 @@ fn cleanup_lose_screen(mut _commands: Commands) {}
 
 fn setup_win_screen(
     mut commands: Commands,
-    player: Single<&ScoreMultiplier, With<Player>>,
+    player: Single<(&ScoreMultiplier, &Fuel, &Transform), With<Player>>,
+    time_passed: Res<TimePassed>,
     font: Res<MainFont>,
     game_sounds: Res<GameSounds>,
 ) {
     let font = &font.0;
+
+    let score = ((MAX_TIME_SCORE_BONUS
+        - time_passed.0.as_secs_f32() * TIME_SCORE_BONUS_REDUCTION_FACTOR)
+        + (player.1.0 as f32 * FUEL_SCORE_BONUS_FACTOR)
+        + (player.2.translation.y * MAX_HEIGHT_SCORE_BONUS_FACTOR))
+        * player.0.0;
 
     commands.spawn((
         DespawnOnExit(GamePhase::Win),
@@ -1052,8 +1067,8 @@ fn setup_win_screen(
         },
         children![(
             Text::new(format!(
-                "You Landed Successfully!\nPress SPACE to return to menu.\nScore Multiplier: {:.2}",
-                player.0
+                "You Landed Successfully!\nPress SPACE to return to menu.\nScore: {:.2}",
+                score
             )),
             TextColor(Color::WHITE),
             TextLayout::new_with_justify(Justify::Center),
@@ -1062,6 +1077,7 @@ fn setup_win_screen(
                 font: font.clone(),
                 ..default()
             },
+            TextBackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.8)),
         )],
     ));
 
